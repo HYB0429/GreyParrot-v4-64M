@@ -30,13 +30,25 @@ out = model.generate(prompt_ids, max_new=100, use_cache=True,
 - 严格因果：当前 token 刚完成的块不会立即被自身读取，下一 token 才可读取。
 - RoPE 使用绝对位置 offset；当前支持默认 `rkm_conv_k=1`。
 
+## 正确性审查修复
+
+- TeLU-GLU 反向在 clamp 饱和区保留外层 `x` 的导数，边界处与原 `torch.clamp` 梯度一致，不再把大正 gate 的梯度清零。
+- RKM phase cache 统一为 `[B,H,nP]`，避免 batch 维自动广播造成样本间相位历史混用。
+- `generate()` 分离原始返回序列和截断模型上下文；长 prompt 不再被截断返回，`min_len` 按实际新 token 数计算。
+- batch 生成维护逐样本 `finished`；先结束的样本后续只写 EOS，全部结束后停止。
+- checkpoint 保存／恢复 train、validation、Torch CPU 和 CUDA RNG，以及固定验证 offsets；不兼容的模型配置会拒绝续训。
+- 每次验证使用固定 offsets，减少 best-val 的抽样噪声。
+- Chunked CE 的 weight dtype 转换移到循环外；`ignore_index` 不再被映射为 class 0。训练数据仍须保证除 `ignore_index` 外的 target 都在 `[0,V)`。
+- TSA 删除一次无效 gather，并增加 prompt、batch 和 cache capacity 检查。
+
 ## 验证结果
 
 - 小模型融合损失误差：0；参数梯度最大绝对误差：6.33e-8。
 - 分块扫描覆盖 T=64/65/129/130/512、非整除尾块、零／非零初始状态：最大输出误差 1.78e-15，最大输入梯度误差 1.74e-18（FP64 单元测试）。
 - 整模型 T=130 分块路径：损失误差 0，参数梯度最大误差 3.73e-8，prefill 最大误差 1.56e-7。
 - TSA 自动 query 循环已实测触发 1、2、3 块，并在极低预算下封顶为 3。
-- 缓存测试覆盖 12 个逐步 token，并跨过完成块边界。
+- 缓存测试覆盖 batch=1/2/3/4，每种连续 12 个逐步 token 并跨过完成块边界，最大 logits 差约 0.011。
+- TeLU 极值／边界、RMSNorm、含 ignore-index 的 Chunked CE、RNG 恢复、长 prompt 和逐样本 EOS 均有专项回归。
 - 8.20M 已训练检查点：贪心缓存／整段序列一致；逐步 logits 最大差约 0.038。
 - 完整 64M：8 个贪心生成 token 与整段前向一致，最大 logits 差 0.0359。
 - 随机采样不保证序列完全相同：接近均匀或并列概率会因单 token GEMM 与整段 GEMM 的舍入差而改变抽样。
@@ -63,6 +75,7 @@ out = model.generate(prompt_ids, max_new=100, use_cache=True,
 | Fast 分块扫描前，CE chunk 512 | 2.490 s | 22.685 s | 25.175 s |
 | Fast＋RKM chunk 64，CE chunk 512，第 1 次 | 2.643 s | 2.721 s | **5.363 s** |
 | 同上，独立进程复测 | 2.557 s | 2.824 s | **5.381 s** |
+| 正确性修复版，CE 转换移出循环 | 2.769 s | 2.620 s | **5.390 s** |
 
 分块扫描版相对原版整步约加速 7.75 倍，相对分块扫描前的 Fast 版约加速 4.68 倍；反向约加速 8.11 倍。以上为当前沙箱双核 CPU 的两次独立进程实测，不是 W7900D 数据；GPU 上需重新选择扫描块长并实测。梯度等价验证通过。GPU 推荐从 `--ce-chunk 1024 --rkm-scan-chunk 64` 开始，不默认开激活检查点。
 
@@ -75,7 +88,7 @@ python train_v6_fast.py \
   --rkm-scan-chunk 64 --grad-accum 1 --max-steps 10000
 ```
 
-新增 `--max-seconds` 限时基准、`--compile-mode` 编译策略、独立验证集与估算训练 TFLOPS 日志。限时停止也会保存检查点。
+新增 `--max-seconds` 限时基准、`--compile-mode` 编译策略和独立验证集。日志中的 `parameter_equivalent_training_tflops` 是参数当量估算，不是实测 kernel FLOPS；`train_peak_mem_gb` 仅表示训练阶段峰值。限时停止也会保存检查点。
 
 ## 后续 GPU 优化边界
 
