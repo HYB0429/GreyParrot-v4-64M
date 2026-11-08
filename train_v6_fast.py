@@ -2,7 +2,7 @@
 """GreyParrot v6 单机单卡训练；ROCm 沿用 PyTorch 的 cuda 接口。
 
 示例：
-python train_v6.py --data tokens.npy --out runs/gp64 --device cuda \
+python train_v6_fast.py --data tokens.npy --out runs/gp64 --device cuda \
   --dtype bf16 --batch-size 8 --seq-len 512 --grad-accum 1 --max-steps 10000
 
 数据是一维整数 token 的 .npy；最后 1%（可用 --val-tokens 改）作验证集。
@@ -55,10 +55,22 @@ def parse_args():
     return p.parse_args()
 
 
-def save_checkpoint(path, model, optimizer, scheduler, step, best_val, cfg, args):
+def capture_rng_state(train_rng, val_rng, device):
+    state = dict(train_rng=train_rng.bit_generator.state,
+                 val_rng=val_rng.bit_generator.state,
+                 torch=torch.get_rng_state())
+    if device.type == "cuda":
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def save_checkpoint(path, model, optimizer, scheduler, step, best_val, cfg, args,
+                    train_rng, val_rng, device, val_offsets):
     payload = dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
                    scheduler=scheduler.state_dict(), step=step, best_val=best_val,
-                   cfg=cfg, args=vars(args), torch_version=torch.__version__)
+                   cfg=cfg, args=vars(args), torch_version=torch.__version__,
+                   rng_state=capture_rng_state(train_rng, val_rng, device),
+                   val_offsets=np.asarray(val_offsets))
     tmp = str(path) + ".tmp"
     torch.save(payload, tmp)
     os.replace(tmp, path)
@@ -112,16 +124,20 @@ def main():
 
     train_rng = np.random.default_rng(args.seed)
     val_rng = np.random.default_rng(args.seed + 1)
+    n = args.seq_len + 1
+    val_start = 0 if val_array is not None else train_end
+    val_source = val_array if val_array is not None else tokens
+    val_end = len(val_source)
+    val_offsets = val_rng.integers(0, val_end - val_start - n + 1,
+                                   size=(args.val_batches, args.batch_size)) + val_start
 
-    def get_batch(split):
+    def get_batch(split, val_index=None):
         if split == "train":
             rng, source, start, end = train_rng, tokens, 0, train_end
-        elif val_array is not None:
-            rng, source, start, end = val_rng, val_array, 0, len(val_array)
+            offsets = rng.integers(0, end - start - n + 1, size=args.batch_size) + start
         else:
-            rng, source, start, end = val_rng, tokens, train_end, len(tokens)
-        n = args.seq_len + 1
-        offsets = rng.integers(0, end - start - n + 1, size=args.batch_size) + start
+            source = val_source
+            offsets = val_offsets[val_index]
         arr = np.stack([np.asarray(source[o:o + n], dtype=np.int64) for o in offsets])
         pair = torch.from_numpy(arr)
         if device.type == "cuda":
@@ -167,10 +183,34 @@ def main():
     step, best_val = 0, float("inf")
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+        saved_cfg = ckpt.get("cfg", {})
+        runtime_only = {"ce_chunk", "activation_checkpoint", "rkm_scan_chunk",
+                        "tsa_vec_budget", "report_stats"}
+        mismatched = {k: (v, cfg.get(k)) for k, v in saved_cfg.items()
+                      if k not in runtime_only and k in cfg and cfg[k] != v}
+        if mismatched:
+            raise ValueError(f"resume 模型配置不兼容: {mismatched}")
+        saved_args = ckpt.get("args", {})
+        changed_training = [k for k in ("batch_size", "seq_len", "grad_accum", "lr",
+                                       "min_lr", "warmup", "max_steps")
+                            if k in saved_args and saved_args[k] != getattr(args, k)]
+        if changed_training:
+            print("warning: resume 改变了训练参数:", ", ".join(changed_training))
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         step, best_val = int(ckpt["step"]), float(ckpt.get("best_val", float("inf")))
+        if "val_offsets" in ckpt:
+            val_offsets = np.asarray(ckpt["val_offsets"])
+        rng_state = ckpt.get("rng_state")
+        if rng_state:
+            train_rng.bit_generator.state = rng_state["train_rng"]
+            val_rng.bit_generator.state = rng_state["val_rng"]
+            torch.set_rng_state(rng_state["torch"])
+            if device.type == "cuda" and "cuda" in rng_state:
+                torch.cuda.set_rng_state_all(rng_state["cuda"])
+        else:
+            print("warning: 旧 checkpoint 不含 RNG；本次续训不是严格随机状态恢复")
         print(f"resumed step={step}, best_val={best_val}")
     train_net = torch.compile(model, mode=args.compile_mode) if args.compile else model
     if args.compile:
@@ -184,8 +224,8 @@ def main():
     def validate():
         train_net.eval()
         values = []
-        for _ in range(args.val_batches):
-            x, y = get_batch("val")
+        for val_index in range(len(val_offsets)):
+            x, y = get_batch("val", val_index)
             with autocast():
                 loss, _ = train_net(x, y, chunk=tsa_chunk, ce_chunk=args.ce_chunk,
                                     activation_checkpoint=False)
@@ -239,9 +279,9 @@ def main():
                 flops_per_token += 2 * n_params
             record = dict(step=step, train_loss=float(running_loss / max(1, running_micro)),
                           lr=optimizer.param_groups[0]["lr"], tokens_per_s=n_tokens / interval_s,
-                          elapsed_s=now-last_time, estimated_training_tflops=n_tokens*flops_per_token/interval_s/1e12)
+                          elapsed_s=now-last_time, parameter_equivalent_training_tflops=n_tokens*flops_per_token/interval_s/1e12)
             if device.type == "cuda":
-                record["peak_mem_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
+                record["train_peak_mem_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
                 torch.cuda.reset_peak_memory_stats(device)
             if should_val:
                 val_loss = validate()
@@ -256,12 +296,12 @@ def main():
             last_time, last_step = time.perf_counter(), step
         if args.save_interval > 0 and (step % args.save_interval == 0 or step == args.max_steps):
             save_checkpoint(out / "latest.pt", model, optimizer, scheduler, step,
-                            best_val, cfg, args)
+                            best_val, cfg, args, train_rng, val_rng, device, val_offsets)
             print("saved", out / "latest.pt", flush=True)
 
     if args.max_steps == 0 or args.max_seconds > 0:
         save_checkpoint(out / "latest.pt", model, optimizer, scheduler, step,
-                        best_val, cfg, args)
+                        best_val, cfg, args, train_rng, val_rng, device, val_offsets)
 
 
 if __name__ == "__main__":
