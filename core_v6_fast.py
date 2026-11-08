@@ -62,9 +62,11 @@ class FusedTeLUGLU(torch.autograd.Function):
         gc = gf.clamp(-20.0, 15.0)
         e = torch.exp(gc)
         th = torch.tanh(e)
-        active = (gf > -20.0) & (gf < 15.0)
-        derivative = torch.where(active, th + gf * e * (1.0 - th.square()),
-                                 torch.zeros_like(th))
+        # clamp 区间内包含指数项导数；区间外指数饱和，但外层 x 的导数仍保留。
+        active = (gf >= -20.0) & (gf <= 15.0)
+        extra = torch.where(active, gf * e * (1.0 - th.square()),
+                            torch.zeros_like(th))
+        derivative = th + extra
         dgate = grad.float() * up.float() * derivative
         dup = grad.float() * (gf * th)
         return dgate.to(gate.dtype), dup.to(up.dtype)
@@ -186,7 +188,7 @@ class RKMExpertV6Fast(RKMExpertV6):
             raise NotImplementedError("当前增量缓存支持默认 conv_k=1")
         A, raw, amp, lam_, omega = self._project(x)
         phi = omega.cumsum(dim=1).unsqueeze(2) if self.use_phase else None
-        cache = dict(raw_prev=raw[:, -1], phase_prev=phi[:, -1] if phi is not None else None)
+        cache = dict(raw_prev=raw[:, -1], phase_prev=phi[:, -1, 0] if phi is not None else None)
         if self.use_phase:
             c, s = torch.cos(phi[:, -1]), torch.sin(phi[:, -1])
             cache["state_rot"] = _rotate_cs(final_state.float(), c, s, inverse=True)
@@ -206,12 +208,13 @@ class RKMExpertV6Fast(RKMExpertV6):
             v = lam * raw + (1.0 - lam) * A.unsqueeze(-1) * cache["raw_prev"].unsqueeze(1)
         state_rot = cache["state_rot"]
         if self.use_phase:
-            phi = cache["phase_prev"] + omega.unsqueeze(2)
-            c, s = torch.cos(phi), torch.sin(phi)
+            # 统一保存 [B,H,nP]，避免 batch 维在增量步骤中交叉广播。
+            phi = cache["phase_prev"] + omega[:, 0]
+            c, s = torch.cos(phi[:, None, None]), torch.sin(phi[:, None, None])
             rotated = _rotate_cs(v, c, s, inverse=True)
             state_rot = A[:, 0].unsqueeze(-1) * state_rot + rotated[:, 0]
             u = _rotate_cs(state_rot, c[:, 0], s[:, 0]).unsqueeze(1)
-            cache["phase_prev"] = phi[:, 0]
+            cache["phase_prev"] = phi
         else:
             state_rot = A[:, 0].unsqueeze(-1) * state_rot + v[:, 0]
             u = state_rot.unsqueeze(1)
@@ -265,6 +268,8 @@ class TSASkeletonV6Fast(TSASkeletonV6):
     @torch.no_grad()
     def build_cache(self, x, max_len):
         B, T, _ = x.shape
+        if max_len < T:
+            raise ValueError(f"TSA cache max_len={max_len} 小于 prompt 长度 {T}")
         BH = B * self.H
         q, k, v, ds, qr, kr, _ = self._project_all(x)
         def alloc_like(z):
@@ -287,6 +292,10 @@ class TSASkeletonV6Fast(TSASkeletonV6):
         H, hd, BH = self.H, self.hd, B * self.H
         a, r, m, w, b = self.a, self.r, self.m, self.w_loc, self.top_b
         pos = cache["length"]
+        if B != cache["B"]:
+            raise ValueError("TSA step batch 与缓存不一致")
+        if pos >= cache["q"].shape[1]:
+            raise RuntimeError(f"TSA cache capacity exceeded: max_len={cache['q'].shape[1]}")
         q, k, v, ds, qr, kr, gate_ = self._project_all(x, offset=pos)
         for name, z in (("q", q), ("k", k), ("v", v), ("ds", ds)):
             cache[name][:, pos] = z[:, 0]
@@ -311,7 +320,6 @@ class TSASkeletonV6Fast(TSASkeletonV6):
             route_sel = F.pad(route_raw, (0, max(0, b-S))).gather(2, blk_safe)
             valid_blk = blk < S
             land = torch.stack(cache["land"], 1)[:, :S]
-            selected = land.gather(1, blk_safe.view(BH, b, 1, 1).expand(BH, b, m, r))
             # 块内局部地标索引转绝对位置。
             block_offset = blk_safe.view(BH, b, 1, 1) * self.seg
             selected_abs = land.gather(1, blk_safe.view(BH, b, 1, 1).expand(BH, b, m, r)) + block_offset
