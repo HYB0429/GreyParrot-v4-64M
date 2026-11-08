@@ -76,13 +76,13 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         ctx.compute_dtype = compute_dtype
         n_valid = (tf != ignore_index).sum()
         loss_sum = torch.zeros((), device=h.device, dtype=torch.float32)
+        wc = weight.to(compute_dtype)
         for i in range(0, hf.shape[0], chunk):
             hc, tc = hf[i:i + chunk], tf[i:i + chunk]
             hc_compute = hc.to(compute_dtype)
-            wc = weight.to(compute_dtype)
             lp = F.log_softmax(F.linear(hc_compute, wc).float(), dim=-1)
             valid = tc != ignore_index
-            safe = tc.clamp_min(0)
+            safe = torch.where(valid, tc, torch.zeros_like(tc))
             nll = -lp.gather(1, safe.unsqueeze(1)).squeeze(1)
             loss_sum += (nll * valid.to(nll.dtype)).sum()
         ctx.save_for_backward(h, targets, weight, n_valid)
@@ -97,14 +97,14 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         gh_flat = torch.empty_like(hf)
         gw = torch.zeros_like(weight)
         denom = n_valid.clamp_min(1).to(torch.float32)
+        wc = weight.to(ctx.compute_dtype)
         for i in range(0, hf.shape[0], ctx.chunk):
             hc, tc = hf[i:i + ctx.chunk], tf[i:i + ctx.chunk]
             compute_dtype = ctx.compute_dtype
             hc_compute = hc.to(compute_dtype)
-            wc = weight.to(compute_dtype)
             lp = F.log_softmax(F.linear(hc_compute, wc).float(), dim=-1)
             valid = tc != ctx.ignore_index
-            safe = tc.clamp_min(0)
+            safe = torch.where(valid, tc, torch.zeros_like(tc))
             grad_logits = lp.exp()
             grad_logits.scatter_add_(1, safe.unsqueeze(1),
                                      -valid.to(grad_logits.dtype).unsqueeze(1))
@@ -234,21 +234,29 @@ class GreyParrotV6(nn.Module):
     def generate(self, idx, max_new=40, temperature=0.7, top_p=0.9,
                  eos=EOS, min_len=4, max_seq_len=512, use_cache=True):
         self.eval()
-        cur = idx
+        if max_seq_len < 1:
+            raise ValueError("max_seq_len 必须为正整数")
+        result = idx
+        finished = torch.zeros(idx.shape[0], dtype=torch.bool, device=idx.device)
         if use_cache:
-            if idx.shape[1] > max_seq_len:
-                cur = idx[:, -max_seq_len:]
-            logits, caches = self.prefill_cached(cur, cur.shape[1]+max_new)
+            context = idx[:, -max_seq_len:]
+            logits, caches = self.prefill_cached(context, context.shape[1] + max_new)
         for i in range(max_new):
             if not use_cache:
-                logits, _ = self(cur[:, -max_seq_len:], last_logits_only=True)
+                logits, _ = self(result[:, -max_seq_len:], last_logits_only=True)
             nxt = self._sample(logits, temperature, top_p)
-            cur = torch.cat([cur, nxt], dim=1)
-            if cur.shape[1]-idx.shape[1] >= min_len and bool((nxt == eos).all()):
-                break
-            if use_cache and i+1 < max_new:
+            if eos is not None:
+                # 已结束样本只继续写入 EOS，不再生成任意后续内容。
+                nxt = torch.where(finished.unsqueeze(1), torch.full_like(nxt, eos), nxt)
+            result = torch.cat([result, nxt], dim=1)
+            generated = i + 1
+            if eos is not None and generated >= min_len:
+                finished |= nxt.squeeze(1).eq(eos)
+                if bool(finished.all()):
+                    break
+            if use_cache and i + 1 < max_new:
                 logits = self.step_cached(nxt, caches)
-        return cur
+        return result
 
 
 def count_params(model):
