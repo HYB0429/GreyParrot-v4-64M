@@ -1,95 +1,152 @@
 # GreyParrot-v4-64M
 
-分块扫描、融合训练算子与 RKM/TSA 缓存。仓库发布名为 GreyParrot-v4-64M，代码内部架构版本为 v6。
+![logo](logo.png)
 
-## 使用
+A 64M-parameter Chinese/English conversational language model trained entirely from scratch by a single developer. Architecture, training code and data recipes are all open and reproducible.
+
+- **Parameters**: 63,979,160 (~64M)
+- **Architecture**: hybrid **RKM** multi-scale selective state-space + **TSA** fixed-pool sparse attention — *not* a vanilla Transformer
+- **Training hardware**: a single AMD Radeon W7900D (RDNA3 / gfx1100, 48GB), ROCm + PyTorch 2.6
+- **Weights**: bf16 single file, ~169 MB
+- **Developer**: hyb0429
+- **Positioning**: a minimal conversational model for tinkering and research. **It is not a productivity tool** — knowledge, reasoning and stability are all bounded by the 64M scale. See [Limitations](#limitations).
+
+## Quick start
 
 ```python
-import torch
-from model_v6_fast import GreyParrotV6, build_64m
+import torch, sentencepiece as spm
+from model_v6_fast import build_64m, EOS
 
-# 直接加载原 v6 checkpoint，权重名和形状不变。
-model = GreyParrotV6(V=32018, cfg=cfg)
-model.load_state_dict(checkpoint["model"])
-model.eval()
+model, cfg, n_params = build_64m(verbose=False)
+ckpt = torch.load("greyparrot_64m_chat_v0.1_bf16.pt", map_location="cpu", weights_only=False)
+model.load_state_dict(ckpt["model"])
+model = model.float().eval()
 
-out = model.generate(prompt_ids, max_new=100, use_cache=True,
-                     temperature=0.8, top_p=0.9)
+sp = spm.SentencePieceProcessor(model_file="greyparrot_sp32k.model")
+prompt = "用户：你好，请介绍一下你自己。\n助手："   # chat template: full-width colon
+ids = torch.tensor([sp.encode(prompt)])
+
+out = model.generate(ids, 120, temperature=0.7, top_p=0.9, eos=EOS, use_cache=True)
+print(sp.decode(out[0].tolist()))
 ```
 
-`use_cache=False` 可回退到原始整段前向。训练仍调用 `model(x, y)`。Fast 版本使用自定义 `FusedTeLUGLU`／`FusedRMSNorm` autograd 节点，RKM 使用数值等价的两级分块仿射扫描；默认扫描块长为 64，可用配置项 `rkm_scan_chunk` 或训练参数 `--rkm-scan-chunk` 调整。
+Chat template is fixed as `用户：{question}\n助手：` (note the full-width colon `：`), EOS id = 3. More test prompts in `code/ab_gen.py`.
 
-## 实现内容
+> v0.1 is the SFT-v1 final checkpoint (step 8612, val 3.2149). A small identity patch (self-introduction data) is planned as v0.1.1 — those weights currently live on a halted training machine and will be attached when it is back.
 
-- RKM 两级分块扫描：块内 inclusive 仿射扫描、块摘要扫描、prefix state 合并；支持非整除尾块和非零初始状态。短于等于块长时直接走原扫描，模型 8 层逐层循环保持不变。
-- TSA 自适应 query 分块：按元素预算自动选择 1～3 块，不再随预算下降产生任意长的 Python 循环；显式 `--tsa-chunk` 仍可覆盖自动模式。
-- TeLU-GLU 自定义 autograd：一次 forward 节点和一次 backward 节点，同时计算 gate/up 梯度；减少 autograd 图和中间保存。它是算子图合并，不等于 eager 模式已经生成单个硬件 kernel。
-- 减少同步：CUDA 梯度裁剪优先使用 fused 实现；生成时先满足 `min_len` 再检查 EOS，避免早期每步 GPU→CPU 同步。
-- TSA 缓存：逐层预分配 K/V、query、方向分数和独立 query/key 路由投影；每个完成块只计算一次摘要、方向地标和压缩 KV。
-- RKM 缓存：旋转坐标递归状态、累计相位和梯形规则的原始前一项输入。
-- 严格因果：当前 token 刚完成的块不会立即被自身读取，下一 token 才可读取。
-- RoPE 使用绝对位置 offset；当前支持默认 `rkm_conv_k=1`。
+Generation runs at ~80-100 tok/s on CPU (measured in this repo's dev sandbox); the whole model fits comfortably on any consumer GPU.
 
-## 正确性审查修复
+## Weights
 
-- TeLU-GLU 反向在 clamp 饱和区保留外层 `x` 的导数，边界处与原 `torch.clamp` 梯度一致，不再把大正 gate 的梯度清零。
-- RKM phase cache 统一为 `[B,H,nP]`，避免 batch 维自动广播造成样本间相位历史混用。
-- `generate()` 分离原始返回序列和截断模型上下文；长 prompt 不再被截断返回，`min_len` 按实际新 token 数计算。
-- batch 生成维护逐样本 `finished`；先结束的样本后续只写 EOS，全部结束后停止。
-- checkpoint 保存／恢复 train、validation、Torch CPU 和 CUDA RNG，以及固定验证 offsets；不兼容的模型配置会拒绝续训。
-- 每次验证使用固定 offsets，减少 best-val 的抽样噪声。
-- Chunked CE 的 weight dtype 转换移到循环外；`ignore_index` 不再被映射为 class 0。训练数据仍须保证除 `ignore_index` 外的 target 都在 `[0,V)`。
-- TSA 删除一次无效 gather，并增加 prompt、batch 和 cache capacity 检查。
+The v0.1 chat checkpoint is attached to the [v0.1 release](../../releases/download/v0.1/greyparrot_64m_chat_v0.1_bf16.pt) (169 MB, bf16 weights-only: `model` / `cfg` / `step`). It exceeds GitHub's 100 MB file limit, so it is distributed as a release asset rather than in the git tree.
 
-## 验证结果
+## Architecture
 
-- 小模型融合损失误差：0；参数梯度最大绝对误差：6.33e-8。
-- 分块扫描覆盖 T=64/65/129/130/512、非整除尾块、零／非零初始状态：最大输出误差 1.78e-15，最大输入梯度误差 1.74e-18（FP64 单元测试）。
-- 整模型 T=130 分块路径：损失误差 0，参数梯度最大误差 3.73e-8，prefill 最大误差 1.56e-7。
-- TSA 自动 query 循环已实测触发 1、2、3 块，并在极低预算下封顶为 3。
-- 缓存测试覆盖 batch=1/2/3/4，每种连续 12 个逐步 token 并跨过完成块边界，最大 logits 差约 0.011。
-- TeLU 极值／边界、RMSNorm、含 ignore-index 的 Chunked CE、RNG 恢复、长 prompt 和逐样本 EOS 均有专项回归。
-- 8.20M 已训练检查点：贪心缓存／整段序列一致；逐步 logits 最大差约 0.038。
-- 完整 64M：8 个贪心生成 token 与整段前向一致，最大 logits 差 0.0359。
-- 随机采样不保证序列完全相同：接近均匀或并列概率会因单 token GEMM 与整段 GEMM 的舍入差而改变抽样。
+| Item | Value |
+|---|---|
+| Vocab | 32,018 (SentencePiece BPE) |
+| d_model | 640 |
+| Layers | 8 |
+| Attention heads | 10 x head_dim 64 |
+| FFN | d_ff 1600, output RMSNorm (ln_offn) |
 
-## 当前双核 CPU 实测
+Every block combines two heterogeneous branches:
 
-完整 64M、prompt 64、生成 8 tokens：
+**RKM (multi-scale selective state-space model)** — modes=4, heads=4, scan_chunk=64, trapezoidal parameterization + phase term + omega_base frequency basis. Handles long sequences at linear complexity.
 
-- 无缓存：1.3279 秒。
-- 有缓存：0.3914 秒。
-- 加速：3.39 倍。
-- 峰值进程内存：0.864 GB。
+**TSA (fixed-pool sparse attention)** — pool=45, top_b=4, delta=0.1, seg=32, adaptive query chunking 1-3. A fixed-size memory pool replaces the full KV cache: long-range retrieval with constant inference memory.
 
-8.20M、prompt 24、生成 30 tokens：缓存约 1.56 倍。短生成的 prefill 和 Python 算子开销占比较高；更长生成通常收益更明显。以上不是 W7900D 数据。
+Engineering: chunked-scan forward *and* backward with merged kernel launches; adaptive TSA query chunking (1-3) so short and long sequences both avoid launch overhead; `torch.compile` target `hidden-notsa` (RKM/FFN fully compiled, TSA kept eager due to data-dependent control flow).
 
-## 训练加速实测
+## Training pipeline
 
-完整 64M，双核 CPU，batch 1、序列 512、FP32：
+1. **Pretraining** on `hyb0429/greyparrot-v3-mixed-385m` (ModelScope, mixed zh/en corpus), multiple time-boxed windows, to step 71,186 — val_loss 2.3683.
+2. **SFT v1** (`greyparrot64m_sft`): MiniMind sft_t2t 150k, 2h window, step 8,612, val_loss 3.2149. Learned chat format (code blocks, lists, Chinese retention); content was the weak layer.
+3. **SFT v2** (`greyparrot64m_sft_v2`): quality-first 77,160-sample mix (COIG-CQIA + Qwen3-235B distill minus math + MiniMind), 5 epochs. val plateaued at 3.59 while open-ended generation collapsed — see Pitfall #2. Not released.
+4. **SFT v3** (`greyparrot64m_sft_v3`): broad 166,328-sample mix (Magpie-zh, Alpaca-GPT4-zh, smoltalk-zh added, plus 41 self-identity samples) restarted from pretraining; halted after discovering v2's weights were poisoned.
+5. **v0.1 release** = SFT v1 final. An identity patch (41 "I am GreyParrot" samples + 3,000 v3-mix samples, lr 5e-6, 1 epoch) is queued as v0.1.1 so the model introduces itself correctly; it was trained but its weights are on the (currently halted) training box.
 
-| 实现 | 前向 | 反向 | 合计 |
-|---|---:|---:|---:|
-| 原 v6，CE chunk 256 | 2.903 s | 38.778 s | 41.681 s |
-| Fast，CE chunk 256 | 2.624 s | 24.456 s | 27.080 s |
-| Fast 分块扫描前，CE chunk 512 | 2.490 s | 22.685 s | 25.175 s |
-| Fast＋RKM chunk 64，CE chunk 512，第 1 次 | 2.643 s | 2.721 s | **5.363 s** |
-| 同上，独立进程复测 | 2.557 s | 2.824 s | **5.381 s** |
-| 正确性修复版，CE 转换移出循环 | 2.769 s | 2.620 s | **5.390 s** |
+### Data recipe (v3 mix, builder in `code/prep_sft_v3.py`)
 
-分块扫描版相对原版整步约加速 7.75 倍，相对分块扫描前的 Fast 版约加速 4.68 倍；反向约加速 8.11 倍。以上为当前沙箱双核 CPU 的两次独立进程实测，不是 W7900D 数据；GPU 上需重新选择扫描块长并实测。梯度等价验证通过。GPU 推荐从 `--ce-chunk 1024 --rkm-scan-chunk 64` 开始，不默认开激活检查点。
+| Source | Samples | Processing |
+|---|---|---|
+| COIG-CQIA (m-a-p) | 25,135 | human-verified Chinese, math removed |
+| Qwen3-235B-2507 distill | 30,820 | math/STEM removed |
+| MiniMind sft_t2t | 25,000 | sampled |
+| Magpie-Qwen2-Pro-200K-Chinese | 22,330 | reward>=1.0, quality good/excellent |
+| Alpaca-GPT4 Chinese | 47,186 | GPT-4 task instructions |
+| smoltalk-chinese | 20,590 | per-file caps, math files excluded |
+| GreyParrot self-identity (self-built) | 41 | fixed persona: 64M / RKM+TSA / hyb0429 |
+
+Uniform processing: refusal/persona-leak regex filter, math-length filter, global MD5 dedup on first user turn, drop (never truncate) samples over 512 tokens, loss on assistant spans only.
+
+## Reproduction
 
 ```bash
-python train_v6_fast.py \
-  --data train_tokens.int32.npy \
-  --val-data validation_tokens.int32.npy \
-  --out runs/gp64 --device cuda --dtype bf16 \
-  --batch-size 8 --seq-len 512 --ce-chunk 1024 \
-  --rkm-scan-chunk 64 --grad-accum 1 --max-steps 10000
+# Pretraining data: hyb0429/greyparrot-v3-mixed-385m on ModelScope
+python train_v6_fast.py ...            # see run configs in docs
+
+# SFT (--init = weights only, --resume = full state)
+python train_sft.py --data-dir sft_bin_v3 --init <pretrain_weights> \
+  --device cuda --dtype bf16 --batch-size 16 --lr 2e-5 \
+  --max-steps 20800 --compile --compile-target hidden-notsa
 ```
 
-新增 `--max-seconds` 限时基准、`--compile-mode` 编译策略和独立验证集。日志中的 `parameter_equivalent_training_tflops` 是参数当量估算，不是实测 kernel FLOPS；`train_peak_mem_gb` 仅表示训练阶段峰值。限时停止也会保存检查点。
+Environment: ROCm 6.x, PyTorch 2.6 (note: `torch.load` defaults to `weights_only=True` since 2.6 — loading checkpoints from this repo needs `weights_only=False`), sentencepiece, numpy.
 
-## 后续 GPU 优化边界
+## Pitfalls (all actually hit)
 
-当前版本尚未使用 Triton／HIP 写真正的单 kernel RMSNorm、RoPE、TeLU-GLU 或 MTA。ROCm 上建议先对 Fast 模型做 BF16 和 `torch.compile` 实测，再决定是否写专用 kernel；不能把自定义 autograd 节点的收益冒充为硬件融合收益。
+Ranked by pain:
+
+1. **Never-validated save path**. SFT ran 2,000 steps before the first checkpoint save, which crashed on an undefined `val_rng` — two hours of training lost. *Always smoke-test the save/restore path first.*
+2. **Narrow-distribution over-training collapse** (the big one). v2 aggressively filtered out "AI-assistant-style" answers and trained 5 epochs. In-distribution val stayed flat at 3.59 from step 10,000 — while open-ended generation rotted into "number of numbers" loops. *In-distribution validation cannot detect generative degeneration; run open-ended A/B generation regularly.*
+3. **ROCm host-side deadlock**. Log stops advancing, step counter frozen, yet the process burns CPU (one thread spinning at 97%, GPU busy=0). Kill and resume from the latest checkpoint. Detection heuristic: log mtime >5 min stale with frozen step count.
+4. **`pkill -f` self-kill**. `pkill -f "train_sft.py"` also matches the wrapping remote shell and kills your own SSH session (exit 255). Use `pgrep -af` + `kill <PID>`.
+5. **`setsid nohup` background launch hangs SSH**. The session doesn't exit until local timeout — the process *did* start. *Always verify in a fresh connection; never retry the launch after a timeout*, or two automation paths start duplicate trainers writing the same run dir (happened with v3).
+6. **torch 2.6 `weights_only=True` default**. Loading own checkpoints (containing a `TorchVersion` object) fails unless you pass `weights_only=False`.
+7. **Full-width-paren regex disaster**. A filter written as `智能助手（小|—|，|是）` intended a group, but full-width（）are literal characters and the inner `|` is still alternation — the branch `，` matched nearly every Chinese sentence and silently killed 99% of the data. *Always use half-width non-capturing groups `(?:...)`.*
+8. **rocm-smi measurement side effect**. Querying GPU state stalls training (reproducibly). Keep monitoring scripts off high-frequency rocm-smi calls.
+9. **Shared multi-tenant box**. Neighbors at 100% GPU and load averages of 15+ are normal there; check your own process before blaming the machine.
+10. **SentencePiece decode normalizes punctuation**. Full-width `，？：` decode to half-width `,?:`. Normalize both sides before matching dataset text, or audits silently miss rows.
+11. **Parallel-scp split parts arrive incomplete**. Always verify byte counts before `cat`, or the reassembled checkpoint blows up at `torch.load` time.
+12. **Mid-cosine checkpoints are not judgeable**. Un-annealed mid-schedule checkpoints produce systematically distorted samples (v2 step-10000 was once misdiagnosed as "data poisoning"; it was just the schedule). Final quality calls require the annealed final.
+
+## Optimization log
+
+- **Pretraining**: 46,037 → 71,186 steps across time-boxed windows, val 2.649 → 2.368 (best 2.3683 @ 71186). Throughput 16.9k tok/s on the W7900D (bf16, B16xT512, log basis).
+- **Kernel-launch merging**: chunked-scan fwd/bwd launch merging; adaptive TSA query chunking 1-3 so neither short nor long sequences waste launches.
+- **Compile strategy**: `--compile-target hidden-notsa` — RKM/FFN fully compiled via inductor, TSA's data-dependent control flow stays eager. Stable.
+- **Restart-free LR reschedule**: the LambdaLR closure reads `args.max_steps` live; when 8 epochs proved too many at step 16,000, resuming with `--max-steps 24000` re-anchored the cosine mid-flight (verified: 6.4e-6 matched prediction) — no restart needed.
+- **Data iteration**: v1 (single source) → v2 (quality trio + heavy filtering, 5 epochs, collapse) → v3 (six-source broad mix + self-identity) → v0.1 (v1 + identity patch). Every version was A/B'd at temperature 0.7 *and* 0.1.
+- **Checkpoint slimming**: training checkpoints with optimizer state are 768 MB; the slim script casts to bf16 weights-only at 169 MB, then 8-way parallel transfer with byte-count verification (see Pitfall #11).
+
+## Limitations
+
+- 64M params: small knowledge base, frequent factual errors, weak math/complex reasoning — verify anything important.
+- Refusal-style responses ("我无法提供…") and occasional degenerate loops; higher sampling temperature makes both worse.
+- No internet access; knowledge ends at the training-data cutoff.
+- Multi-turn and long-context quality degrade quickly (trained at T=512).
+- v0.1 has no self-identity training: asked "who are you", it dodges or mispersonates. v0.1.1 will fix this.
+
+## Roadmap
+
+- [ ] Full v3 recipe from pretraining (166k six-source mix, 2 epochs, lr 2e-5)
+- [ ] Stronger multi-turn (sharegpt-style long dialogs, larger T)
+- [ ] DPO experiment
+- [ ] Quantized builds (int4/int8, CPU-friendly)
+
+## Repo layout
+
+- `model_v6_fast.py` (repo root) — model definition (RKM + TSA)
+- `code/train_sft.py` — SFT trainer (init/resume, chunked CE, LambdaLR)
+- `code/prep_sft_v3.py` — v3 data builder (sources, filters, dedup, packing)
+- `code/gen_identity.py` — self-identity data generator
+- `code/ab_gen.py` — A/B generation harness
+- `docs/ENGINEERING.md` — v4 engineering notes: chunked scans, fused ops, cache correctness, benchmarks (Chinese)
+- `config.json` — model config
+- `greyparrot_sp32k.model` — SentencePiece tokenizer
+- `greyparrot_64m_chat_v0.1_bf16.pt` — v0.1 weights (release asset, see above)
+
+## License
+
+Code and weights: Apache-2.0. Training data comes from public datasets (COIG-CQIA, Qwen3 distill, MiniMind, Magpie, Alpaca-GPT4, smoltalk-chinese, etc.) under their respective licenses — verify each source's terms before commercial use.
