@@ -147,6 +147,12 @@ Ranked by pain:
 - `greyparrot_sp32k.model` — SentencePiece tokenizer
 - `greyparrot_64m_chat_v0.1_bf16.pt` — v0.1 weights (release asset, see above)
 
+## Acknowledgements
+
+- **AMD**: all training was done on a single AMD Radeon W7900D (RDNA3, 48GB) with ROCm and PyTorch. Thanks to the AMD ROCm team for the open software stack that makes consumer-grade GPU training accessible to individual developers.
+- **The Mamba team**: thanks to Albert Gu, Tri Dao and the selective state space model community (S4, Mamba, and follow-ups). The multi-scale selective scan design of the RKM branch is directly inspired by their work.
+- **The open data ecosystem**: COIG-CQIA, MiniMind, Magpie, Alpaca-GPT4, smoltalk-chinese and the Qwen team, whose public datasets and distills made the SFT mixture possible.
+
 ## License
 
 Code and weights: Apache-2.0. Training data comes from public datasets (COIG-CQIA, Qwen3 distill, MiniMind, Magpie, Alpaca-GPT4, smoltalk-chinese, etc.) under their respective licenses — verify each source's terms before commercial use.
