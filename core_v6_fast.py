@@ -6,12 +6,41 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from core_v6 import (RMSNorm, RKMExpertV6, TSASkeletonV6, _normalize,
                      _rotate_cs, _affine_scan, apply_rope, telu, VEC_ELEM_BUDGET)
 
+try:
+    from triton_kernels import (triton_available, scan_pair_triton,
+                                scan_pair_bwd_triton, rmsnorm_triton,
+                                telu_glu_triton, rotate_cs_fwd_triton,
+                                rotate_cs_bwd_triton, cumsum_time_triton,
+                                qk1_triton, qv1_triton, tsa_core_triton)
+except Exception:
+    def triton_available():
+        return False
+
 __all__ = ["RKMExpertV6Fast", "TSASkeletonV6Fast", "ParallelDualBrainV6Fast",
            "DenseFFNV6Fast", "FusedTeLUGLU", "FusedRMSNorm", "RMSNormFast"]
+
+
+class _CumsumTimeTritonAuto(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        with torch.no_grad():
+            return cumsum_time_triton(x)
+
+    @staticmethod
+    def backward(ctx, dy):
+        # reverse cumsum：反向序列求和后再恢复原时间顺序。
+        return cumsum_time_triton(dy.flip(1)).flip(1)
+
+
+def _cumsum_time(x):
+    if triton_available() and x.is_cuda:
+        return _CumsumTimeTritonAuto.apply(x)
+    return x.cumsum(dim=1)
 
 
 class FusedRMSNorm(torch.autograd.Function):
@@ -43,6 +72,8 @@ class RMSNormFast(nn.Module):
         self.eps = eps
 
     def forward(self, x):
+        if triton_available() and x.is_cuda:
+            return rmsnorm_triton(x, self.w, self.eps)
         return FusedRMSNorm.apply(x, self.w, self.eps)
 
 
@@ -81,14 +112,13 @@ class DenseFFNV6Fast(nn.Module):
 
     def forward(self, x):
         gate, up = self.gate_up(x).split(self.d_ff, dim=-1)
+        if triton_available() and x.is_cuda:
+            return self.down(telu_glu_triton(gate, up))
         return self.down(FusedTeLUGLU.apply(gate, up))
 
 
-def _scan_pair(a, b, initial=None):
-    """同时返回 inclusive 累计乘积 a 和状态 b。"""
-    if initial is not None:
-        b = b.clone()
-        b[:, 0] = b[:, 0] + a[:, 0].unsqueeze(-1)*initial
+def _scan_pair_eager(a, b):
+    """eager Hillis-Steele；也是 Triton 前向的反向重算参考。"""
     off = 1
     while off < a.shape[1]:
         ao, bo = a, b
@@ -98,6 +128,61 @@ def _scan_pair(a, b, initial=None):
         b[:, off:] = bo[:, off:] + ao[:, off:].unsqueeze(-1)*bo[:, :-off]
         off *= 2
     return a, b
+
+
+class _ScanPairTritonAuto(torch.autograd.Function):
+    """前向整段 1 kernel；反向为反向时间仿射扫描（λ/μ 合并一次扫描）+
+    1 个组合 kernel。数学与 eager autograd 相同（fp64 对照误差 1e-13）。"""
+
+    @staticmethod
+    def forward(ctx, a, b):
+        with torch.no_grad():
+            ao, bo = scan_pair_triton(a, b)
+        ctx.save_for_backward(a, b, ao, bo)
+        return ao, bo
+
+    @staticmethod
+    def backward(ctx, da, db):
+        a, b, ao, bo = ctx.saved_tensors
+        ga, gb = scan_pair_bwd_triton(a, b, ao, bo, da, db)
+        return ga, gb
+
+
+class _RotateCSTritonAuto(torch.autograd.Function):
+    """旋转前向 1 kernel；反向 eager 重算，梯度与参考实现一致。"""
+
+    @staticmethod
+    def forward(ctx, x, c, s, inverse):
+        ctx.save_for_backward(x, c, s)
+        ctx.inverse = inverse
+        with torch.no_grad():
+            return rotate_cs_fwd_triton(x, c, s, inverse)
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, c, s = ctx.saved_tensors
+        dx, dc, ds = rotate_cs_bwd_triton(x, c, s, dy, ctx.inverse)
+        # c/s 可能有广播维（如 M 维），归约回原始形状。
+        return dx, dc.sum_to_size(c.shape), ds.sum_to_size(s.shape), None
+
+
+def _rotate_cs_fast(x, c, s, inverse=False):
+    if x.is_cuda and triton_available():
+        return _RotateCSTritonAuto.apply(x, c, s, inverse)
+    return _rotate_cs(x, c, s, inverse=inverse)
+
+
+def _scan_pair(a, b, initial=None):
+    """同时返回 inclusive 累计乘积 a 和状态 b。"""
+    if initial is not None:
+        b = b.clone()
+        b[:, 0] = b[:, 0] + a[:, 0].unsqueeze(-1)*initial
+    if a.shape[1] > 1 and a.is_cuda and triton_available():
+        if torch.is_grad_enabled() and (a.requires_grad or b.requires_grad):
+            return _ScanPairTritonAuto.apply(a, b)
+        # 推理前向：整段扫描单个 Triton kernel。
+        return scan_pair_triton(a, b)
+    return _scan_pair_eager(a, b)
 
 
 def _affine_scan_chunked(A, L, state=None, chunk_size=64):
@@ -126,7 +211,7 @@ def _affine_scan_chunked(A, L, state=None, chunk_size=64):
 
 
 class RKMExpertV6Fast(RKMExpertV6):
-    def forward(self, x, state=None, return_state=False):
+    def forward(self, x, state=None, return_state=False, return_cache=False):
         B, T, D = x.shape
         M, H, dh, nP = self.M, self.H, self.dh, self.n_pairs
         xi = x
@@ -140,6 +225,7 @@ class RKMExpertV6Fast(RKMExpertV6):
         A = torch.exp(-F.softplus(theta))
         Vh = Vt.float().reshape(B, T, H, dh)
         v = g.unsqueeze(-1).unsqueeze(-1)*Vh.unsqueeze(2)
+        raw = v
         if self.use_trapz:
             lam = torch.sigmoid(lam_.float()).view(B, T, M, H, 1)
             v_prev = torch.cat([v.new_zeros(B, 1, M, H, dh), v[:, :-1]], dim=1)
@@ -148,11 +234,11 @@ class RKMExpertV6Fast(RKMExpertV6):
             omega = om_.float().view(B, T, H, nP)
             if self.omega_base is not None:
                 omega = omega + self.omega_base.float().view(1, 1, H, nP)
-            phi = omega.cumsum(dim=1).unsqueeze(2)
+            phi = _cumsum_time(omega).unsqueeze(2)
             c, s = torch.cos(phi), torch.sin(phi)
-            u = _affine_scan_chunked(A, _rotate_cs(v, c, s, inverse=True), state=state,
+            u = _affine_scan_chunked(A, _rotate_cs_fast(v, c, s, inverse=True), state=state,
                                      chunk_size=getattr(self, "scan_chunk", 64))
-            u = _rotate_cs(u, c, s)
+            u = _rotate_cs_fast(u, c, s)
         else:
             u = _affine_scan_chunked(A, v, state=state, chunk_size=getattr(self, "scan_chunk", 64))
         final_state = u[:, -1]
@@ -163,6 +249,13 @@ class RKMExpertV6Fast(RKMExpertV6):
         coeff = amp.view(B, T, M, 1)*gate
         acc = torch.einsum('btmh,btmhd,mhd->bthd', coeff, uhat, w).reshape(B, T, D)
         out = self.Wo(telu(acc.to(x.dtype)))
+        if return_cache:
+            cache = dict(raw_prev=raw[:, -1], phase_prev=phi[:, -1, 0] if self.use_phase else None)
+            if self.use_phase:
+                cache["state_rot"] = _rotate_cs_fast(final_state, c[:, -1], s[:, -1], inverse=True)
+            else:
+                cache["state_rot"] = final_state.float()
+            return out, final_state, cache
         return (out, final_state) if return_state else out
 
     def _project(self, x):
@@ -187,11 +280,11 @@ class RKMExpertV6Fast(RKMExpertV6):
         if self.conv is not None:
             raise NotImplementedError("当前增量缓存支持默认 conv_k=1")
         A, raw, amp, lam_, omega = self._project(x)
-        phi = omega.cumsum(dim=1).unsqueeze(2) if self.use_phase else None
+        phi = _cumsum_time(omega).unsqueeze(2) if self.use_phase else None
         cache = dict(raw_prev=raw[:, -1], phase_prev=phi[:, -1, 0] if phi is not None else None)
         if self.use_phase:
             c, s = torch.cos(phi[:, -1]), torch.sin(phi[:, -1])
-            cache["state_rot"] = _rotate_cs(final_state.float(), c, s, inverse=True)
+            cache["state_rot"] = _rotate_cs_fast(final_state.float(), c, s, inverse=True)
         else:
             cache["state_rot"] = final_state.float()
         return cache
@@ -211,9 +304,9 @@ class RKMExpertV6Fast(RKMExpertV6):
             # 统一保存 [B,H,nP]，避免 batch 维在增量步骤中交叉广播。
             phi = cache["phase_prev"] + omega[:, 0]
             c, s = torch.cos(phi[:, None, None]), torch.sin(phi[:, None, None])
-            rotated = _rotate_cs(v, c, s, inverse=True)
+            rotated = _rotate_cs_fast(v, c, s, inverse=True)
             state_rot = A[:, 0].unsqueeze(-1) * state_rot + rotated[:, 0]
-            u = _rotate_cs(state_rot, c[:, 0], s[:, 0]).unsqueeze(1)
+            u = _rotate_cs_fast(state_rot, c[:, 0], s[:, 0]).unsqueeze(1)
             cache["phase_prev"] = phi
         else:
             state_rot = A[:, 0].unsqueeze(-1) * state_rot + v[:, 0]
@@ -230,6 +323,24 @@ class RKMExpertV6Fast(RKMExpertV6):
 
 
 class TSASkeletonV6Fast(TSASkeletonV6):
+    fused_attn_core = True
+
+    def attn_core(self, q, Kall, Vall, bias, route_bias, valid, scale):
+        if self.fused_attn_core and triton_available() and q.is_cuda:
+            return tsa_core_triton(q, Kall, Vall, bias, route_bias, valid,
+                                   scale, self.delta)
+        return super().attn_core(q, Kall, Vall, bias, route_bias, valid, scale)
+
+    def qk(self, q, k):
+        if triton_available() and q.is_cuda:
+            return qk1_triton(q, k)
+        return super().qk(q, k)
+
+    def qv(self, w, v):
+        if triton_available() and w.is_cuda:
+            return qv1_triton(w, v)
+        return super().qv(w, v)
+
     @torch.no_grad()
     def _project_all(self, x, offset=0):
         B, T, _ = x.shape
@@ -249,10 +360,12 @@ class TSASkeletonV6Fast(TSASkeletonV6):
 
     def _make_block(self, cache, block_idx):
         seg = self.seg
+        hd = self.hd
         i0, i1 = block_idx * seg, (block_idx + 1) * seg
         B, BH = cache["B"], cache["BH"]
         q = cache["q"][:, i0:i1]
-        k, v = cache["k"][:, i0:i1], cache["v"][:, i0:i1]
+        kv = cache["kv"][:, i0:i1]
+        k, v = kv[..., :hd], kv[..., hd:]
         ds = cache["ds"][:, i0:i1]
         summary = _normalize(cache["kr"][:, i0:i1].mean(1))
         land = ds.reshape(BH, seg, self.m).permute(0, 2, 1).topk(self.r, dim=-1).indices
@@ -260,28 +373,52 @@ class TSASkeletonV6Fast(TSASkeletonV6):
         cs = torch.einsum('bld,bd->bl', k, Ql) / math.sqrt(self.hd)
         ca = torch.softmax(cs.float(), dim=1).to(k.dtype)
         Vsh = torch.einsum('bl,bld->bd', ca, v)
-        cache["summaries"].append(summary)
-        cache["land"].append(land)
-        cache["Ksh"].append(Ql)
-        cache["Vsh"].append(Vsh)
+        cache["summaries"][:, block_idx] = summary
+        cache["land"][:, block_idx] = land
+        cache["KVsh"][:, block_idx, :hd] = Ql
+        cache["KVsh"][:, block_idx, hd:] = Vsh
 
     @torch.no_grad()
-    def build_cache(self, x, max_len):
+    def build_cache(self, x, max_len, projections=None):
         B, T, _ = x.shape
         if max_len < T:
             raise ValueError(f"TSA cache max_len={max_len} 小于 prompt 长度 {T}")
         BH = B * self.H
-        q, k, v, ds, qr, kr, _ = self._project_all(x)
+        hd = self.hd
+        if projections is None:
+            q, k, v, ds, qr, kr, _ = self._project_all(x)
+        else:
+            q, k, v, ds, qr, kr = projections
         def alloc_like(z):
             shape = (z.shape[0], max_len) + tuple(z.shape[2:])
             out = z.new_empty(shape)
             out[:, :T] = z
             return out
-        cache = dict(B=B, BH=BH, length=T, q=alloc_like(q), k=alloc_like(k),
-                     v=alloc_like(v), ds=alloc_like(ds), qr=alloc_like(qr), kr=alloc_like(kr),
-                     summaries=[], land=[], Ksh=[], Vsh=[])
-        for bi in range(T // self.seg):
-            self._make_block(cache, bi)
+        max_blocks = max_len // self.seg
+        S = T // self.seg
+        kv = q.new_empty(BH, max_len, 2 * hd)
+        kv[:, :T, :hd] = k
+        kv[:, :T, hd:] = v
+        cache = dict(B=B, BH=BH, length=T, completed=S, q=alloc_like(q), kv=kv,
+                     ds=alloc_like(ds), kr=alloc_like(kr),
+                     summaries=kr.new_empty(B, max_blocks, self.d_router),
+                     land=torch.empty(BH, max_blocks, self.m, self.r, dtype=torch.long, device=x.device),
+                     KVsh=q.new_empty(BH, max_blocks, 2 * hd))
+        if S:
+            # 整段 prefill 一次构建全部已完成块，避免逐块 Python 循环。
+            qb = q[:, :S*self.seg].reshape(BH, S, self.seg, hd)
+            kb = k[:, :S*self.seg].reshape(BH, S, self.seg, hd)
+            vb = v[:, :S*self.seg].reshape(BH, S, self.seg, hd)
+            summaries = _normalize(kr[:, :S*self.seg].reshape(B, S, self.seg, self.d_router).mean(2))
+            land = ds[:, :S*self.seg].reshape(BH, S, self.seg, self.m).permute(0, 1, 3, 2).topk(self.r, dim=-1).indices
+            Ql = self.land_norm(qb.mean(2))
+            cs = torch.einsum('bsld,bsd->bsl', kb, Ql) / math.sqrt(hd)
+            ca = torch.softmax(cs.float(), dim=2).to(k.dtype)
+            Vsh = torch.einsum('bsl,bsld->bsd', ca, vb)
+            cache["summaries"][:, :S] = summaries
+            cache["land"][:, :S] = land
+            cache["KVsh"][:, :S, :hd] = Ql
+            cache["KVsh"][:, :S, hd:] = Vsh
         return cache
 
     @torch.no_grad()
@@ -297,21 +434,23 @@ class TSASkeletonV6Fast(TSASkeletonV6):
         if pos >= cache["q"].shape[1]:
             raise RuntimeError(f"TSA cache capacity exceeded: max_len={cache['q'].shape[1]}")
         q, k, v, ds, qr, kr, gate_ = self._project_all(x, offset=pos)
-        for name, z in (("q", q), ("k", k), ("v", v), ("ds", ds)):
+        for name, z in (("q", q), ("ds", ds)):
             cache[name][:, pos] = z[:, 0]
-        cache["qr"][:, pos] = qr[:, 0]
+        cache["kv"][:, pos, :hd] = k[:, 0]
+        cache["kv"][:, pos, hd:] = v[:, 0]
         cache["kr"][:, pos] = kr[:, 0]
         cache["length"] = pos + 1
         if cache["length"] % self.seg == 0:
             self._make_block(cache, cache["length"] // self.seg - 1)
+            cache["completed"] = cache["length"] // self.seg
         # 刚由当前 token 完成的块仍属于当前块，必须到下一 token 才可见。
-        S = min(len(cache["summaries"]), pos // self.seg)
+        S = min(cache["completed"], pos // self.seg)
         dt = q.dtype
         Dn = _normalize(self.directions.to(dt))
         topa = torch.matmul(q, Dn.transpose(0, 1)).topk(a, dim=-1).indices
         qr = _normalize(qr).unsqueeze(1).expand(B, H, 1, self.d_router).reshape(BH, 1, self.d_router)
         if S:
-            summaries = torch.stack(cache["summaries"], 1)[:, :S]
+            summaries = cache["summaries"][:, :S]
             summaries = summaries.unsqueeze(1).expand(B, H, S, self.d_router).reshape(BH, S, self.d_router)
             route_raw = torch.bmm(qr, summaries.transpose(1, 2))
             route_pad = F.pad(route_raw, (0, max(0, b-S)), value=-torch.inf)
@@ -319,7 +458,7 @@ class TSASkeletonV6Fast(TSASkeletonV6):
             blk_safe = blk.clamp_max(S-1)
             route_sel = F.pad(route_raw, (0, max(0, b-S))).gather(2, blk_safe)
             valid_blk = blk < S
-            land = torch.stack(cache["land"], 1)[:, :S]
+            land = cache["land"][:, :S]
             # 块内局部地标索引转绝对位置。
             block_offset = blk_safe.view(BH, b, 1, 1) * self.seg
             selected_abs = land.gather(1, blk_safe.view(BH, b, 1, 1).expand(BH, b, m, r)) + block_offset
@@ -349,16 +488,14 @@ class TSASkeletonV6Fast(TSASkeletonV6):
         route_idx_bias = F.pad(route_direct, (0, self.Aloc)).gather(-1, order)
         route_bias_all = torch.cat([route_idx_bias, route_sel], -1) * self.route_bias
         gather_idx = act_s.clamp(0, pos)
-        flat_gather = gather_idx.squeeze(1).unsqueeze(-1).expand(BH, self.Aidx, hd)
-        Kidx = cache["k"].gather(1, flat_gather).unsqueeze(1)
-        Vidx = cache["v"].gather(1, flat_gather).unsqueeze(1)
+        flat_gather = gather_idx.squeeze(1).unsqueeze(-1).expand(BH, self.Aidx, 2 * hd)
+        KVidx = cache["kv"].gather(1, flat_gather).unsqueeze(1)
+        Kidx, Vidx = KVidx[..., :hd], KVidx[..., hd:]
         if S:
-            Ksh = torch.stack(cache["Ksh"], 1)[:, :S]
-            Vsh = torch.stack(cache["Vsh"], 1)[:, :S]
-            gi = blk_safe.unsqueeze(-1).expand(BH, 1, b, hd)
-            Kcomp = Ksh.unsqueeze(1).expand(BH, 1, S, hd).gather(2, gi)
-            Vcomp = Vsh.unsqueeze(1).expand(BH, 1, S, hd).gather(2, gi)
-            Kall, Vall = torch.cat([Kidx, Kcomp], 2), torch.cat([Vidx, Vcomp], 2)
+            gi = blk_safe.unsqueeze(-1).expand(BH, 1, b, 2 * hd)
+            KVcomp = cache["KVsh"][:, :S].unsqueeze(1).expand(BH, 1, S, 2 * hd).gather(2, gi)
+            Kall = torch.cat([Kidx, KVcomp[..., :hd]], 2)
+            Vall = torch.cat([Vidx, KVcomp[..., hd:]], 2)
         else:
             Kall, Vall = F.pad(Kidx, (0, 0, 0, b)), F.pad(Vidx, (0, 0, 0, b))
         scores = torch.einsum('bqd,bqad->bqa', q, Kall).float() / math.sqrt(hd)
@@ -407,19 +544,28 @@ class ParallelDualBrainV6Fast(nn.Module):
         self.report_stats = bool(kwargs.get("report_stats", False))
         self.last_norm_L = self.last_norm_R = None
 
-    def forward(self, x, disable=None, chunk=None):
-        h_L = 0.0 if disable == 'L' else self.ln_oL(self.rkm(self.ln_L(x)))
-        h_R = 0.0 if disable == 'R' else self.ln_oR(self.tsa(self.ln_R(x), chunk=chunk))
+    def forward(self, x, disable=None, chunk=None, checkpoint_rkm=False, checkpoint_tsa=False):
+        if disable == 'L':
+            h_L = 0.0
+        else:
+            xr = self.ln_L(x)
+            hr = checkpoint(self.rkm, xr, use_reentrant=False) if checkpoint_rkm else self.rkm(xr)
+            h_L = self.ln_oL(hr)
+        if disable == 'R':
+            h_R = 0.0
+        else:
+            xt = self.ln_R(x)
+            ht = checkpoint(self.tsa, xt, chunk=chunk, use_reentrant=False) if checkpoint_tsa else self.tsa(xt, chunk=chunk)
+            h_R = self.ln_oR(ht)
         return x + self.gamma_L*h_L + self.gamma_R*h_R, x.new_zeros(())
 
     @torch.no_grad()
     def prefill(self, x, max_len):
         xr = self.ln_L(x)
-        h_L, rstate = self.rkm(xr, return_state=True)
-        rcache = self.rkm.build_cache(xr, rstate)
+        h_L, rstate, rcache = self.rkm(xr, return_state=True, return_cache=True)
         xt = self.ln_R(x)
-        h_R = self.tsa(xt)
-        tcache = self.tsa.build_cache(xt, max_len)
+        h_R, projections = self.tsa(xt, return_projections=True)
+        tcache = self.tsa.build_cache(xt, max_len, projections=projections)
         out = x + self.gamma_L*self.ln_oL(h_L) + self.gamma_R*self.ln_oR(h_R)
         return out, (rcache, tcache)
 
