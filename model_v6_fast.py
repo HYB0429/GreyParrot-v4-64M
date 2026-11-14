@@ -31,7 +31,7 @@ DEFAULT_CFG_V6 = dict(
     tsa_m=8, tsa_a=4, tsa_r=2, tsa_w_loc=8, tsa_seg=32,
     tsa_d_c=16, tsa_delta=0.1, tsa_vec_budget=VEC_ELEM_BUDGET,
     tsa_top_b=4, tsa_d_router=32,
-    dropout=0.0, activation_checkpoint=False, ce_chunk=256,
+    dropout=0.0, activation_checkpoint=False, checkpoint_modules=[], ce_chunk=1024,
     report_stats=False,
 )
 
@@ -55,11 +55,22 @@ class V6Block(nn.Module):
         self.dual.rkm.scan_chunk = int(cfg.get("rkm_scan_chunk", 64))
         self.ln_ffn = RMSNorm(D)
         self.ffn = DenseFFNV6(D, cfg["d_ff"])
+        # TeLU-GLU 在正区间无界；输出归一化阻止残差逐层正反馈放大。
+        self.ln_offn = RMSNorm(D)
         self.gamma_ffn = nn.Parameter(torch.ones(D) * 0.5)
+        self.checkpoint_modules = set(cfg.get("checkpoint_modules", []))
 
-    def forward(self, x, disable=None, chunk=None):
-        xa, aux = self.dual(x, disable=disable, chunk=chunk)
-        return xa + self.gamma_ffn * self.ffn(self.ln_ffn(xa)), aux
+    def forward(self, x, disable=None, chunk=None, selective_checkpoint=True):
+        selective = (selective_checkpoint and self.training and torch.is_grad_enabled()
+                     and bool(self.checkpoint_modules))
+        xa, aux = self.dual(
+            x, disable=disable, chunk=chunk,
+            checkpoint_rkm=selective and "rkm" in self.checkpoint_modules,
+            checkpoint_tsa=selective and "tsa" in self.checkpoint_modules)
+        y = self.ln_ffn(xa)
+        ff = (checkpoint(self.ffn, y, use_reentrant=False)
+              if selective and "ffn" in self.checkpoint_modules else self.ffn(y))
+        return xa + self.gamma_ffn * self.ln_offn(ff), aux
 
 
 class _ChunkedCrossEntropy(torch.autograd.Function):
@@ -80,10 +91,10 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         for i in range(0, hf.shape[0], chunk):
             hc, tc = hf[i:i + chunk], tf[i:i + chunk]
             hc_compute = hc.to(compute_dtype)
-            lp = F.log_softmax(F.linear(hc_compute, wc).float(), dim=-1)
+            logits = F.linear(hc_compute, wc).float()
             valid = tc != ignore_index
             safe = torch.where(valid, tc, torch.zeros_like(tc))
-            nll = -lp.gather(1, safe.unsqueeze(1)).squeeze(1)
+            nll = F.cross_entropy(logits, safe, reduction="none")
             loss_sum += (nll * valid.to(nll.dtype)).sum()
         ctx.save_for_backward(h, targets, weight, n_valid)
         ctx.chunk, ctx.ignore_index = chunk, ignore_index
@@ -102,10 +113,11 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
             hc, tc = hf[i:i + ctx.chunk], tf[i:i + ctx.chunk]
             compute_dtype = ctx.compute_dtype
             hc_compute = hc.to(compute_dtype)
-            lp = F.log_softmax(F.linear(hc_compute, wc).float(), dim=-1)
+            logits = F.linear(hc_compute, wc).float()
             valid = tc != ctx.ignore_index
             safe = torch.where(valid, tc, torch.zeros_like(tc))
-            grad_logits = lp.exp()
+            # 直接由 softmax 得到梯度，不再同时保存 log_softmax 并额外 exp。
+            grad_logits = F.softmax(logits, dim=-1)
             grad_logits.scatter_add_(1, safe.unsqueeze(1),
                                      -valid.to(grad_logits.dtype).unsqueeze(1))
             grad_logits *= valid.to(grad_logits.dtype).unsqueeze(1)
@@ -151,9 +163,9 @@ class GreyParrotV6(nn.Module):
         for blk in self.blocks:
             if use_ckpt and self.training and torch.is_grad_enabled():
                 x, a = checkpoint(blk, x, disable=disable, chunk=chunk,
-                                  use_reentrant=False)
+                                  selective_checkpoint=False, use_reentrant=False)
             else:
-                x, a = blk(x, disable=disable, chunk=chunk)
+                x, a = blk(x, disable=disable, chunk=chunk, selective_checkpoint=True)
             aux = aux + a
         return self.ln_f(x), aux
 
@@ -204,7 +216,7 @@ class GreyParrotV6(nn.Module):
         caches = []
         for blk in self.blocks:
             x, cache = blk.dual.prefill(x, max_len)
-            x = x + blk.gamma_ffn * blk.ffn(blk.ln_ffn(x))
+            x = x + blk.gamma_ffn * blk.ln_offn(blk.ffn(blk.ln_ffn(x)))
             caches.append(cache)
         return self.head(self.ln_f(x[:, -1:])), caches
 
@@ -216,7 +228,7 @@ class GreyParrotV6(nn.Module):
         x = self.embed(idx)
         for blk, cache in zip(self.blocks, caches):
             x = blk.dual.step(x, cache)
-            x = x + blk.gamma_ffn * blk.ffn(blk.ln_ffn(x))
+            x = x + blk.gamma_ffn * blk.ln_offn(blk.ffn(blk.ln_ffn(x)))
         return self.head(self.ln_f(x))
 
     @staticmethod
