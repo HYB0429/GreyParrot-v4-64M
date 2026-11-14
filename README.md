@@ -138,6 +138,9 @@ Ranked by pain:
 ## Repo layout
 
 - `model_v6_fast.py` (repo root) — model definition (RKM + TSA)
+- `core_v6.py` (repo root) — RKM/TSA core implementation (reference)
+- `core_v6_fast.py` (repo root) — fused/compile-friendly implementation with optional Triton kernels
+- `train_v6_fast.py` (repo root) — pretraining trainer
 - `code/train_sft.py` — SFT trainer (init/resume, chunked CE, LambdaLR)
 - `code/prep_sft_v3.py` — v3 data builder (sources, filters, dedup, packing)
 - `code/gen_identity.py` — self-identity data generator
