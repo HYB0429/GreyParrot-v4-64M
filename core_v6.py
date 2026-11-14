@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 __all__ = ["telu", "TeLU", "RMSNorm", "RKMExpertV6", "TSASkeletonV6",
            "ParallelDualBrainV6", "DenseFFNV6", "VEC_ELEM_BUDGET"]
-VEC_ELEM_BUDGET = 25_000_000
+VEC_ELEM_BUDGET = 250_000_000
 _TELU_HI, _TELU_LO, _NEG_MASK = 15.0, -20.0, -1.0e4
 
 
@@ -183,7 +183,9 @@ class TSASkeletonV6(nn.Module):
         assert a <= directions.shape[0] and top_b >= 1 and 1 <= r <= seg
         self.D, self.H, self.hd = D, H, hd
         self.Hhd = H * hd
-        self.directions = directions
+        # 注册为 buffer，才能跟随 model.to(device) 迁移。
+        # persistent=False 避免和 GreyParrotV6 的权威 directions 重复存盘。
+        self.register_buffer("directions", directions, persistent=False)
         self.m = directions.shape[0]
         self.a, self.r, self.w_loc, self.seg = int(a), int(r), int(w_loc), int(seg)
         self.top_b = int(top_b)
@@ -218,7 +220,38 @@ class TSASkeletonV6(nn.Module):
             self.rope_cos, self.rope_sin = c, s
         return self.rope_cos[:T].unsqueeze(0), self.rope_sin[:T].unsqueeze(0)
 
-    def forward(self, x, chunk=None):
+    def qk(self, q, k):
+        return torch.einsum('bqd,bqad->bqa', q, k)
+
+    def qv(self, w, v):
+        return torch.einsum('bqa,bqad->bqd', w, v)
+
+    def attn_core(self, q, Kall, Vall, bias, route_bias, valid, scale):
+        """固定候选池的纯数值核心，可独立 compile，前后向共享同一数学定义。"""
+        dt = Kall.dtype
+        A = self.pool_size
+        scores = self.qk(q, Kall).float() * scale
+        scores = scores + bias + route_bias
+        scores = scores.masked_fill(~valid, _NEG_MASK)
+        e = torch.exp((scores - scores.amax(-1, keepdim=True)).clamp(max=0.0)) * valid.float()
+        if self.delta > 0:
+            ed, dsr = e.sort(dim=-1, descending=True)
+            cum = ed.cumsum(-1)
+            ar = torch.arange(A, device=q.device).view(1, 1, A)
+            nxt = F.pad(ed[..., 1:], (0, 1))
+            tail_ub = (A - ar - 1).clamp_min(0).float() * nxt
+            ok = self.delta * cum >= (1.0 - self.delta) * tail_ub
+            kk = torch.where(ok, ar, torch.full_like(ar, A)).amin(-1, keepdim=True)
+            keep_srt = (ed > 0) & (ar <= kk)
+            keep = torch.zeros_like(keep_srt).scatter_(-1, dsr, keep_srt)
+        else:
+            keep = e > 0
+        weights = e * keep.float()
+        weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-12)
+        out = self.qv(weights.to(dt), Vall)
+        return out, keep, weights
+
+    def forward(self, x, chunk=None, return_projections=False):
         B, T, _ = x.shape
         H, hd, Hhd, BH = self.H, self.hd, self.Hhd, x.shape[0] * self.H
         a, r, m, w, seg, b = self.a, self.r, self.m, self.w_loc, self.seg, self.top_b
@@ -281,11 +314,13 @@ class TSASkeletonV6(nn.Module):
         blk = route_pad.topk(b, dim=-1).indices           # [BH,T,b]
         blk_safe = blk.clamp_max(max(S - 1, 0))
         if S:
-            route_sel = F.pad(route_raw, (0, max(0, b - S))).gather(1, blk_safe)
-            valid_blk = route_valid.unsqueeze(0).expand(BH, T, S).gather(-1, blk_safe)
-            valid_blk = valid_blk & (blk < S)
-            land_rows = land.unsqueeze(1).expand(BH, T, S, m, r)
-            selected = land_rows.gather(2, blk_safe.view(BH, T, b, 1, 1).expand(BH, T, b, m, r))
+            # 沿最后一维（块索引）gather；gather(1) 会在 T 维上取错位置。
+            route_sel = F.pad(route_raw, (0, max(0, b - S))).gather(2, blk_safe)
+            valid_blk = (blk < current_block.view(1, T, 1)) & (blk < S)
+            # 扁平行索引避免构造 [BH,T,S,m,r] 的巨大只读展开。
+            land_rows = land.reshape(BH * S, m * r)
+            land_rows_idx = (blk_safe + torch.arange(BH, device=dev).view(BH, 1, 1) * S).reshape(-1)
+            selected = land_rows.index_select(0, land_rows_idx).reshape(BH, T, b, m, r)
             dir_idx = selected.gather(3, topa.view(BH, T, 1, a, 1).expand(BH, T, b, a, r))
             dir_idx = dir_idx.reshape(BH, T, b * a * r)
             valid_dir = valid_blk.unsqueeze(-1).expand(BH, T, b, a * r).reshape(BH, T, b * a * r)
@@ -332,36 +367,18 @@ class TSASkeletonV6(nn.Module):
             Vidx = vf.index_select(0, gi.reshape(-1)).reshape(BH, cc, self.Aidx, hd)
             if S:
                 gs = blk_safe[:, sl]
-                comp_idx = gs.unsqueeze(-1).expand(BH, cc, b, hd)
-                Kcomp = Ksh.unsqueeze(1).expand(BH, cc, S, hd).gather(2, comp_idx)
-                Vcomp = Vsh.unsqueeze(1).expand(BH, cc, S, hd).gather(2, comp_idx)
+                comp_flat_idx = (gs + torch.arange(BH, device=dev).view(BH, 1, 1) * S).reshape(-1)
+                Kcomp = Ksh.reshape(BH * S, hd).index_select(0, comp_flat_idx).reshape(BH, cc, b, hd)
+                Vcomp = Vsh.reshape(BH * S, hd).index_select(0, comp_flat_idx).reshape(BH, cc, b, hd)
                 Kall = torch.cat([Kidx, Kcomp], dim=2)
                 Vall = torch.cat([Vidx, Vcomp], dim=2)
             else:
                 Kall = F.pad(Kidx, (0, 0, 0, b))
                 Vall = F.pad(Vidx, (0, 0, 0, b))
             # K/V 保持输入精度；仅 logits/softmax 上转，避免四维 fp32 K/V。
-            scores = torch.einsum('bqd,bqad->bqa', q[:, sl], Kall).float() * scale
-            scores = scores + bias_all[:, sl] + route_bias_all[:, sl]
             va = valid_all[:, sl]
-            scores = scores.masked_fill(~va, _NEG_MASK)
-            e = torch.exp((scores - scores.amax(-1, keepdim=True)).clamp(max=0.0)) * va.float()
-            if self.delta > 0:
-                ed, dsr = e.sort(dim=-1, descending=True)
-                cum = ed.cumsum(-1)
-                ar = torch.arange(A, device=dev).view(1, 1, A)
-                nxt = F.pad(ed[..., 1:], (0, 1))
-                tail_ub = (A - ar - 1).clamp_min(0).float() * nxt
-                ok = self.delta * cum >= (1.0 - self.delta) * tail_ub
-                kk = torch.where(ok, ar, torch.full_like(ar, A)).amin(-1, keepdim=True)
-                keep_srt = (ed > 0) & (ar <= kk)
-                keep = torch.zeros_like(keep_srt).scatter_(-1, dsr, keep_srt)
-            else:
-                keep = e > 0
-            weights = e * keep.float()
-            weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-12)
-            out = torch.einsum('bqa,bqad->bqd', weights.to(dt), Vall)
-            return out, keep, weights
+            return self.attn_core(q[:, sl], Kall, Vall, bias_all[:, sl],
+                                  route_bias_all[:, sl], va, scale)
 
         # 真正的 query 分块预算：chunk 由单个 query 块的 K/V 元素数解析得到。
         elems = BH * T * A * hd
@@ -391,7 +408,10 @@ class TSASkeletonV6(nn.Module):
                                   float(wn[..., b*a*r:self.Aidx].sum(-1).mean()),
                                   float(wn[..., self.Aidx:].sum(-1).mean())]
         O = out.reshape(B, H, T, hd).transpose(1, 2).reshape(B, T, Hhd)
-        return self.Wo(O * g_attn)
+        result = self.Wo(O * g_attn)
+        if return_projections:
+            return result, (q, k, v, ds, qr, kr)
+        return result
 
 
 class ParallelDualBrainV6(nn.Module):
